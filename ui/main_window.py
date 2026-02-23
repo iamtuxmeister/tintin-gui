@@ -19,7 +19,10 @@ The horizontal splitter between OutputWidget and MapWidget is user-draggable.
 """
 
 import os
+import re as _re   # FIX 1: single module-level import, not repeated in hot path
 import sys
+import collections as _collections
+
 from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QHBoxLayout, QVBoxLayout,
     QSplitter, QLineEdit, QPushButton, QStatusBar,
@@ -37,10 +40,6 @@ from ui.button_bar       import ButtonBar
 from ui.session_manager  import SessionManager, Session
 
 
-import re as _re
-import collections as _collections
-
-
 class _TabCompleter:
     """
     Collects words from MUD output for tab-completion.
@@ -52,7 +51,7 @@ class _TabCompleter:
     """
     WINDOW     = 500    # lines before a word is forgotten
     MIN_LEN    = 5      # minimum word length (exclusive, so >5 = 6+)
-    _WORD_RE   = _re.compile(r"[a-zA-Z][a-zA-Z']{5,}")  # 6+ chars
+    _WORD_RE   = _re.compile(r"[a-zA-Z][a-zA-Z-]{5,}")   # 6+ chars, letters and dash only
 
     def __init__(self):
         # word -> line_number of last sighting
@@ -270,9 +269,12 @@ class _InputLineEdit(QLineEdit):
                 if sel < cursor:
                     cursor = sel
 
-            # Word immediately left of cursor
+            # Word immediately left of cursor.
+            # Strip trailing punctuation so e.g. "nementa's" → "nementa".
+            # Only letters and dashes are valid completion characters.
             before_cursor = text[:cursor]
             prefix = _re.split(r"\s+", before_cursor)[-1]
+            prefix = _re.sub(r"[^a-zA-Z-]+$", "", prefix)
             if len(prefix) < 2:
                 return
 
@@ -294,10 +296,14 @@ class _InputLineEdit(QLineEdit):
         # The "after" part starts at anchor + len(previous match or prefix).
         # On cycle, the selection covers the previous suffix so we can read
         # "after" as everything past the current selection end.
+
+        # FIX 2: malformed ternary cleaned up — was a single mangled line
         if self.hasSelectedText():
-            after_pos = max(self.selectionStart(), self.selectionEnd())
-            # selectionStart can be > selectionEnd if selected right-to-left
-            after_pos = self.selectionStart() + len(self.selectedText())                 if self.selectionStart() < self.selectionEnd()                 else self.selectionEnd()
+            after_pos = (
+                self.selectionStart() + len(self.selectedText())
+                if self.selectionStart() < self.selectionEnd()
+                else self.selectionEnd()
+            )
         else:
             after_pos = self._tab_anchor + len(self._tab_prefix)
 
@@ -628,13 +634,14 @@ class MainWindow(QMainWindow):
         # Echo locally so you see what you typed
         self._output_local(f"\n\x1b[90m> {text}\x1b[0m\n")
 
+    # FIX 1: removed `import re as _re` that was here inside the method body.
+    # The module-level import at the top of the file is used directly.
     def _on_tt_output(self, data: bytes):
         """Receive raw bytes from TinTin++ — parse, render, check for GMCP."""
         # Pass to output widget (handles ANSI parsing internally)
         self._output.feed_raw(data)
 
         # Feed plain text to tab completer (strip ANSI before word extraction)
-        import re as _re
         plain = _re.sub(rb'\x1b\[[^a-zA-Z]*[a-zA-Z]', b'', data)
         plain = _re.sub(rb'\x1b.', b'', plain)
         self._input.feed_completion(plain.decode('utf-8', errors='replace'))

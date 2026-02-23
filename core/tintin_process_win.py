@@ -11,16 +11,24 @@ Default install location: C:\\Program Files (x86)\\WinTin++\\bin\\tt.exe
 We also check PATH in case the user added it there.
 
 Install pywinpty with:  pip install pywinpty
+
+Threading note
+--------------
+_reader() runs on a daemon background thread and emits output_received and
+process_died signals directly from that thread.  This is intentional and
+safe: PyQt6 automatically queues cross-thread signal emissions (equivalent
+to Qt::QueuedConnection), so the connected slots always execute on the main
+GUI thread on the next event-loop iteration.  No explicit locking is needed
+because the only mutable state _reader() touches is self._pty.isalive() /
+self._pty.read(), which are both safe to call from a non-GUI thread.
 """
 
 import os
 import shutil
-import signal
-import subprocess
 import tempfile
 import threading
 
-from PyQt6.QtCore import QObject, pyqtSignal, QSocketNotifier
+from PyQt6.QtCore import QObject, pyqtSignal
 
 try:
     import winpty
@@ -59,6 +67,10 @@ class TinTinProcess(QObject):
     Windows implementation using pywinpty (ConPTY).
 
     Signals identical to the Linux version so MainWindow needs no changes.
+
+    output_received(bytes) — emitted from the reader thread; PyQt6 queues it
+                             automatically so slots run on the GUI thread.
+    process_died(int)      — same threading contract as output_received.
     """
     output_received = pyqtSignal(bytes)
     process_died    = pyqtSignal(int)
@@ -110,6 +122,9 @@ class TinTinProcess(QObject):
         )
 
         self._running = True
+        # FIX 4: daemon=True so this thread never blocks clean process exit.
+        # Signal emissions from here are automatically queued by PyQt6 to the
+        # GUI thread — no explicit QueuedConnection or locking required.
         self._thread  = threading.Thread(target=self._reader, daemon=True)
         self._thread.start()
         return True
@@ -153,20 +168,28 @@ class TinTinProcess(QObject):
         return self._pty is not None and self._pty.isalive()
 
     def _reader(self):
-        """Background thread: read from ConPTY and emit signals."""
+        """
+        Background thread: read from ConPTY and emit signals.
+
+        Runs until the PTY closes or self._running is cleared by stop().
+        Signal emissions are cross-thread but safe — PyQt6 queues them.
+        """
         while self._running and self._pty and self._pty.isalive():
             try:
                 data = self._pty.read(8192)
                 if data:
+                    # Cross-thread emit — PyQt6 queues this automatically
                     self.output_received.emit(
                         data if isinstance(data, bytes)
                         else data.encode("utf-8", errors="replace")
                     )
             except Exception:
                 break
+
         code = 0
         try:
             code = self._pty.exitstatus if self._pty else 0
         except Exception:
             pass
+        # Cross-thread emit — PyQt6 queues this automatically
         self.process_died.emit(code or 0)

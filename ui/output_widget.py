@@ -21,7 +21,18 @@ Scrollback pane rules:
   - Only visible when split is active
   - Has full scrollbar, user can browse freely
   - Scrolling to the bottom closes the split
+
+FIX 3: _LivePane and _ScrollbackPane now receive an explicit OutputWidget
+reference at construction time instead of walking the parent chain and
+comparing type names — more robust and avoids circular import fragility.
+
+FIX 6: Scrollback is lazy — spans are buffered while the scrollback pane is
+hidden, then flushed in a single batch when open_split() is called.  This
+eliminates the double-render cost during normal play when the split is closed.
 """
+
+from __future__ import annotations
+from typing import TYPE_CHECKING
 
 from PyQt6.QtWidgets import QWidget, QVBoxLayout, QSplitter, QTextEdit
 from PyQt6.QtCore    import Qt, QTimer
@@ -34,10 +45,9 @@ from core.ansi_parser import AnsiParser, AnsiSpan, TextStyle
 
 
 _LIVE_MAX_LINES    = 500
-_SCROLLBACK_MAX    = 10000
+_SCROLLBACK_MAX    = 10_000
 _BG                = QColor(10, 10, 10)
 _FG                = QColor(200, 200, 200)
-
 
 # Bright variants of the 8 standard ANSI colours (indices 8-15)
 _ANSI_BRIGHT = [
@@ -74,7 +84,6 @@ def _make_fmt(style: TextStyle, font: QFont) -> QTextCharFormat:
     if bg:
         fmt.setBackground(QColor(*bg) if isinstance(bg, tuple) else bg)
 
-    # Still set bold weight for font rendering (some terminals do both)
     if style.bold:
         fmt.setFontWeight(QFont.Weight.Bold)
     if style.italic:
@@ -147,33 +156,35 @@ class _Pane(QTextEdit):
 class _LivePane(_Pane):
     """
     Bottom pane — always pinned to latest output, no scrollbar ever.
-    Mouse wheel events are forwarded to OutputWidget to open the split.
+
+    FIX 3: receives an explicit OutputWidget reference instead of walking
+    the parent chain and doing a fragile type-name string comparison.
     """
 
-    def wheelEvent(self, event: QWheelEvent):
-        # Don't scroll the live pane — hand wheel up to OutputWidget
-        ow = self._output_widget()
-        if ow:
-            ow._on_wheel(event.angleDelta().y())
-        # Do NOT call super() — live pane never scrolls via wheel
+    # FIX 3: accept output_widget reference directly
+    def __init__(self, output_widget: "OutputWidget", parent=None):
+        super().__init__(parent)
+        self._ow = output_widget
 
-    def _output_widget(self):
-        p = self.parent()
-        while p:
-            if type(p).__name__ == 'OutputWidget':
-                return p
-            p = p.parent() if callable(getattr(p, 'parent', None)) else None
-        return None
+    def wheelEvent(self, event: QWheelEvent):
+        # Don't scroll the live pane — notify OutputWidget to open the split
+        self._ow._on_wheel(event.angleDelta().y())
+        # Do NOT call super() — live pane never scrolls via wheel
 
 
 class _ScrollbackPane(_Pane):
     """
     Top pane — freely scrollable history, visible only when split is active.
     Scrolling to the very bottom closes the split.
+
+    FIX 3: receives an explicit OutputWidget reference (same rationale as
+    _LivePane above).
     """
 
-    def __init__(self, parent=None):
+    # FIX 3: accept output_widget reference directly
+    def __init__(self, output_widget: "OutputWidget", parent=None):
         super().__init__(parent)
+        self._ow = output_widget
         # Scrollback DOES get a vertical scrollbar
         self.setVerticalScrollBarPolicy(
             Qt.ScrollBarPolicy.ScrollBarAsNeeded
@@ -183,18 +194,9 @@ class _ScrollbackPane(_Pane):
         super().wheelEvent(event)
         # If user scrolled down and hit the bottom, close the split
         if event.angleDelta().y() < 0:
-            ow = self._output_widget()
             sb = self.verticalScrollBar()
-            if ow and sb.value() >= sb.maximum() - 5:
-                ow.close_split()
-
-    def _output_widget(self):
-        p = self.parent()
-        while p:
-            if type(p).__name__ == 'OutputWidget':
-                return p
-            p = p.parent() if callable(getattr(p, 'parent', None)) else None
-        return None
+            if sb.value() >= sb.maximum() - 5:
+                self._ow.close_split()
 
 
 class OutputWidget(QWidget):
@@ -208,12 +210,27 @@ class OutputWidget(QWidget):
         close_split()      — hide scrollback, live resumes auto-scroll
         toggle_split()     — flip state
         font_size          — int property
+
+    FIX 6 (scrollback lazy rendering):
+    While the scrollback pane is hidden, incoming spans are buffered in
+    _pending_spans (capped at _SCROLLBACK_MAX lines worth).  When
+    open_split() is called, the buffer is flushed to the scrollback pane
+    before it becomes visible.  This eliminates the double-render cost
+    during normal play when only the live pane is showing.
     """
+
+    # Rough line estimate per span batch for the pending buffer cap.
+    # We cap the pending buffer at SCROLLBACK_MAX lines to bound memory.
+    _PENDING_LINE_CAP = _SCROLLBACK_MAX
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self._parser       = AnsiParser()
         self._split_active = False
+
+        # FIX 6: pending spans accumulated while scrollback is hidden
+        self._pending_spans: list[AnsiSpan] = []
+        self._pending_lines: int            = 0
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -225,6 +242,7 @@ class OutputWidget(QWidget):
             "QSplitter::handle { background: #3c3c50; }"
         )
 
+        # FIX 3: pass self so panes hold a direct reference, not a name-walk
         self._scrollback = _ScrollbackPane(self)
         self._scrollback.setVisible(False)
 
@@ -248,24 +266,59 @@ class OutputWidget(QWidget):
         if not spans:
             return
 
-        # Live pane — capped, always pinned to bottom
+        # ── Live pane — always updated, capped, pinned to bottom ──────
         self._live.append_spans(spans)
         self._live.trim_to(_LIVE_MAX_LINES)
-        self._live.pin_to_bottom()          # unconditional — always synced
+        self._live.pin_to_bottom()
 
-        # Scrollback — full history, only update if visible (perf)
-        self._scrollback.append_spans(spans)
-        self._scrollback.trim_to(_SCROLLBACK_MAX)
+        # ── Scrollback — FIX 6: lazy ──────────────────────────────────
+        if self._split_active:
+            # Split is open: write directly and trim
+            self._scrollback.append_spans(spans)
+            self._scrollback.trim_to(_SCROLLBACK_MAX)
+        else:
+            # Split is hidden: buffer spans, cap by line count
+            self._pending_spans.extend(spans)
+            for span in spans:
+                self._pending_lines += span.text.count('\n')
+
+            # Keep the pending buffer bounded so memory doesn't grow unbounded
+            # during a long play session with the split never opened.
+            if self._pending_lines > self._PENDING_LINE_CAP:
+                self._trim_pending()
+
+    def _trim_pending(self):
+        """Drop oldest spans from the pending buffer to stay within cap."""
+        excess = self._pending_lines - self._PENDING_LINE_CAP
+        while self._pending_spans and excess > 0:
+            dropped = self._pending_spans.pop(0)
+            excess -= dropped.text.count('\n')
+            self._pending_lines -= dropped.text.count('\n')
+        self._pending_lines = max(0, self._pending_lines)
+
+    def _flush_pending_to_scrollback(self):
+        """Flush buffered spans into the scrollback pane, then clear buffer."""
+        if self._pending_spans:
+            self._scrollback.append_spans(self._pending_spans)
+            self._scrollback.trim_to(_SCROLLBACK_MAX)
+            self._pending_spans.clear()
+            self._pending_lines = 0
 
     def clear(self):
         for pane in (self._live, self._scrollback):
             pane.clear()
             pane._line_count = 0
+        self._pending_spans.clear()
+        self._pending_lines = 0
 
     def open_split(self):
         if self._split_active:
             return
         self._split_active = True
+
+        # FIX 6: flush buffered history before showing scrollback
+        self._flush_pending_to_scrollback()
+
         self._scrollback.setVisible(True)
         # Position scrollback near the bottom so context is visible
         self._scrollback.pin_to_bottom()
