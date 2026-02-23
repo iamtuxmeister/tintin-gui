@@ -1,0 +1,7 @@
+# Core — required on all platforms
+PyQt6>=6.4.0
+
+# Windows only — provides ConPTY support for WinTin++
+# Install on Windows with:  pip install pywinpty
+# Leave uninstalled on Linux/macOS — not needed there
+# pywinpty>=2.0.0
