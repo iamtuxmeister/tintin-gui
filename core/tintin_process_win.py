@@ -82,7 +82,8 @@ class TinTinProcess(QObject):
         self._running    = False
         self._tmp_script = None
 
-    def start(self, script_path=None) -> bool:
+    def start(self) -> bool:
+        """Start WinTin++."""
         if not _WINPTY_OK:
             raise ImportError(
                 "pywinpty is not installed.\n"
@@ -103,10 +104,6 @@ class TinTinProcess(QObject):
             encoding="utf-8",
         )
         self._tmp_script.write(_INIT_SNIPPET)
-        if script_path:
-            # Use forward slashes — tt++ handles them on Windows
-            safe = script_path.replace("\\", "/")
-            self._tmp_script.write(f"\n#read {{{safe}}}\n")
         self._tmp_script.flush()
         self._tmp_script.close()
         tmp_path = self._tmp_script.name.replace("\\", "/")

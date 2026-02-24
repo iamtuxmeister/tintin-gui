@@ -13,6 +13,12 @@
 }
 
 
+#ALIAS {acclogin}
+{
+    assoc chat fezah;
+    storage access hitecible
+}
+
 #ALIAS {at}
 {
     assist ${tank}

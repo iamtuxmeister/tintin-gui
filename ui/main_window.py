@@ -32,12 +32,17 @@ from PyQt6.QtCore  import Qt, QTimer, QObject, QEvent
 from PyQt6.QtGui   import QFont, QFontMetrics, QKeyEvent, QAction, QIcon
 
 from core.tintin_process_compat import TinTinProcess
-from core.map_parser     import MapGraph, try_parse_gmcp_line
+from core.map_parser        import MapGraph, try_parse_gmcp_line
+from core.tt_config_sync    import (
+    TinTinConfigLoader, config_file_path,
+    parse_tin_file, write_config_file,
+)
 from ui.output_widget    import OutputWidget
 from ui.map_widget       import MapWidget
 from ui.right_panel      import RightPanel
 from ui.button_bar       import ButtonBar
-from ui.session_manager  import SessionManager, Session
+from ui.session_manager  import SessionManager, Session, _load_sessions, _save_sessions
+from ui.config_dialog    import ConfigDialog
 
 
 class _TabCompleter:
@@ -153,17 +158,23 @@ class _InputLineEdit(QLineEdit):
             return
 
         # ── Home / End via bare Left / Right ───────────────────────────
+        # If text is selected: Left → start, Right → end (collapse selection)
+        # If no selection: behave like a normal input (move one character)
         if key == Qt.Key.Key_Left and not mods:
-            self.setCursorPosition(0)
-            self._reset_history_state()
-            self._clear_tab_state()
-            return
+            if self.hasSelectedText():
+                self.setCursorPosition(0)
+                self._reset_history_state()
+                self._clear_tab_state()
+                return
+            # else fall through to super() for normal single-char movement
 
         if key == Qt.Key.Key_Right and not mods:
-            self.setCursorPosition(len(self.text()))
-            self._reset_history_state()
-            self._clear_tab_state()
-            return
+            if self.hasSelectedText():
+                self.setCursorPosition(len(self.text()))
+                self._reset_history_state()
+                self._clear_tab_state()
+                return
+            # else fall through to super() for normal single-char movement
 
         # ── Tab completion ──────────────────────────────────────────────
         if key == Qt.Key.Key_Tab:
@@ -476,9 +487,10 @@ class MainWindow(QMainWindow):
         self._apply_dark_palette()
 
         self._tt             = TinTinProcess(self)
-        self._active_session = None   # Session currently connected
-        self._graph = MapGraph()
+        self._active_session = None
+        self._graph          = MapGraph()
         self._map_refresh_pending = False
+        self._config_dlg: ConfigDialog | None = None   # single non-modal instance
 
         # ---- central widget -----------------------------------------
         central = QWidget()
@@ -537,6 +549,7 @@ class MainWindow(QMainWindow):
         self._tt.output_received.connect(self._on_tt_output)
         self._tt.process_died.connect(self._on_tt_died)
         self._buttons.command_requested.connect(self._send_command)
+        self._buttons.buttons_changed.connect(self._on_buttons_changed)
 
         # Debounce map redraws (don't re-render on every single GMCP packet)
         self._map_timer = QTimer(self)
@@ -555,9 +568,9 @@ class MainWindow(QMainWindow):
     # TinTin++ lifecycle
     # ------------------------------------------------------------------
 
-    def _launch_tt(self, script: str = None):
+    def _launch_tt(self, gui_config_path: str = None):
         try:
-            self._tt.start(script)
+            self._tt.start()
             self._conn_label.setText("● TinTin++ running")
             self._conn_label.setStyleSheet("color: #44aa44; padding: 0 8px;")
             self._output_local("\x1b[32m[TinTin++ started — type #session <name> <host> <port> to connect]\x1b[0m\n")
@@ -580,23 +593,39 @@ class MainWindow(QMainWindow):
         self._conn_label.setText(f"● Connecting to {session.name}…")
         self._conn_label.setStyleSheet("color: #aaaa44; padding: 0 8px;")
 
-        # Track active session and restore its saved panel layout
+        # Track active session and restore its saved panel layout + buttons
         self._active_session = session
         if session.panel_layout:
             self._right.restore_layout(session.panel_layout)
+        # Load per-session buttons — block signal so connect doesn't trigger save
+        self._buttons.blockSignals(True)
+        self._buttons.set_buttons(getattr(session, 'buttons', []))
+        self._buttons.blockSignals(False)
 
-        script = session.script or None
-        self._launch_tt(script)
+        # Restore per-session font size (0 means use the application default)
+        saved_font = getattr(session, 'font_size', 0)
+        if saved_font > 0:
+            self._output.font_size = saved_font
 
-        # Issue #session once tt++ has had time to initialise (and load
-        # the script if there is one — script loading needs a little more
-        # time than a bare start)
-        delay = 600 if script else 300
-        cmd   = f"#session {{{session.name}}} {{{session.host}}} {{{session.port}}}"
+        cfg_path = config_file_path(session.name)
+        self._launch_tt()
+
+        # Issue #session once tt++ has initialised
+        delay = 300
+        cmd = f"#session {{{session.name}}} {{{session.host}}} {{{session.port}}}"
         QTimer.singleShot(delay, lambda: self._send_command(cmd))
+
+        # Load GUI config after #session has had time to connect
+        if cfg_path.exists():
+            p = str(cfg_path)
+            QTimer.singleShot(delay + 1500, lambda: self._tt.send(f"#read {{{p}}}"))
+            self._output_local(
+                f"\x1b[32m[Loading config: {cfg_path}]\x1b[0m\n"
+            )
 
         self._conn_label.setText(f"● {session.name}  {session.host}:{session.port}")
         self._conn_label.setStyleSheet("color: #44aa44; padding: 0 8px;")
+
         self._input.grab_focus()
 
     def _on_tt_died(self, code: int):
@@ -607,18 +636,64 @@ class MainWindow(QMainWindow):
         QTimer.singleShot(500, self._restart_and_reconnect)
 
     def _save_panel_layout(self):
-        """Persist the current right-panel layout into the active session."""
+        """Persist right-panel layout, buttons, font size, and all config."""
         if self._active_session is None:
             return
-        from ui.session_manager import _load_sessions, _save_sessions
-        sessions = _load_sessions()
-        layout   = self._right.get_layout()
+
+        # Collect current state into the in-memory session object.
+        # self._active_session is the single source of truth; callers
+        # are responsible for updating it before calling here.
+        # We also pick up anything the open dialog may have that hasn't
+        # been emitted via saved() yet.
+        if self._config_dlg is not None and not self._config_dlg.isHidden():
+            for tab in (self._config_dlg._aliases_tab,
+                        self._config_dlg._actions_tab,
+                        self._config_dlg._timers_tab,
+                        self._config_dlg._highlights_tab,
+                        self._config_dlg._buttons_tab):
+                tab.commit()
+            cfg = self._config_dlg.get_config()
+            self._active_session.buttons    = cfg.get("buttons",    self._active_session.buttons)
+            self._active_session.aliases    = cfg.get("aliases",    self._active_session.aliases)
+            self._active_session.actions    = cfg.get("actions",    self._active_session.actions)
+            self._active_session.timers     = cfg.get("timers",     self._active_session.timers)
+            self._active_session.highlights = cfg.get("highlights", self._active_session.highlights)
+
+        self._active_session.panel_layout = self._right.get_layout()
+        self._active_session.font_size    = getattr(self._output, 'font_size', 0)
+        # Always sync buttons from the live bar (covers edits made outside the dialog)
+        self._active_session.buttons      = self._buttons.get_buttons()
+
+        # Write to disk: load existing sessions, replace matching entry, save back.
+        import sys, traceback
+        print(
+            f"[_save_panel_layout] saving '{self._active_session.name}': "
+            f"buttons={len(self._active_session.buttons)}, "
+            f"font_size={self._active_session.font_size}",
+            file=sys.stderr,
+        )
+        try:
+            sessions = _load_sessions()
+            print(f"[_save_panel_layout] _load_sessions returned {len(sessions)} sessions", file=sys.stderr)
+        except Exception:
+            traceback.print_exc(file=sys.stderr)
+            sessions = []
+
+        matched = False
         for i, s in enumerate(sessions):
             if s.name == self._active_session.name:
-                sessions[i].panel_layout = layout
-                _save_sessions(sessions)
-                self._active_session = sessions[i]
+                sessions[i] = self._active_session
+                matched = True
                 break
+        if not matched:
+            print(f"[_save_panel_layout] session not found in list, appending", file=sys.stderr)
+            sessions.append(self._active_session)
+
+        try:
+            _save_sessions(sessions)
+            print(f"[_save_panel_layout] _save_sessions completed OK", file=sys.stderr)
+        except Exception:
+            traceback.print_exc(file=sys.stderr)
 
     def _restart_and_reconnect(self):
         # tt++ is dead — just show the session manager; it will launch
@@ -677,11 +752,6 @@ class MainWindow(QMainWindow):
         # File menu
         file_menu = bar.addMenu("&File")
 
-        load_act = QAction("&Load TinTin++ script…", self)
-        load_act.setShortcut("Ctrl+O")
-        load_act.triggered.connect(self._load_script)
-        file_menu.addAction(load_act)
-
         load_map_act = QAction("Load &map XML…", self)
         load_map_act.triggered.connect(self._load_map)
         file_menu.addAction(load_map_act)
@@ -723,6 +793,17 @@ class MainWindow(QMainWindow):
         font_smaller.triggered.connect(lambda: self._change_font(-1))
         view_menu.addAction(font_smaller)
 
+        view_menu.addSeparator()
+        config_buttons_act = QAction("Configure &Buttons…", self)
+        config_buttons_act.setShortcut("Ctrl+B")
+        config_buttons_act.triggered.connect(self._configure_buttons)
+        view_menu.addAction(config_buttons_act)
+
+        config_act = QAction("&Configuration…", self)
+        config_act.setShortcut("Ctrl+,")
+        config_act.triggered.connect(self._open_config)
+        view_menu.addAction(config_act)
+
         # Help
         help_menu = bar.addMenu("&Help")
         about_act = QAction("&About", self)
@@ -735,20 +816,6 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
     # Menu handlers
     # ------------------------------------------------------------------
-
-    def _load_script_path(self, path: str):
-        """Load a script directly by path (called from CLI arg)."""
-        self._tt.stop()
-        self._launch_tt(script=path)
-
-    def _load_script(self):
-        path, _ = QFileDialog.getOpenFileName(
-            self, "Load TinTin++ script", str(os.path.expanduser("~")),
-            "TinTin++ scripts (*.tin);;All files (*)"
-        )
-        if path:
-            self._tt.stop()
-            self._launch_tt(script=path)
 
     def _load_map(self):
         path, _ = QFileDialog.getOpenFileName(
@@ -764,15 +831,152 @@ class MainWindow(QMainWindow):
         """Called when the 'Show Map' menu item is toggled."""
         self._right.set_map_visible(checked)
 
+    def _on_buttons_changed(self):
+        """
+        Called immediately whenever the button list changes (edit, delete,
+        config dialog accept).  Saves to session JSON if a session is active,
+        otherwise to the global fallback file.
+        """
+        if self._active_session is not None:
+            # Keep in-memory session in sync so _save_panel_layout always
+            # has current data even if called before the dialog saves.
+            self._active_session.buttons = self._buttons.get_buttons()
+            self._save_panel_layout()
+        else:
+            self._buttons.save_global()
+
+    def _open_config(self):
+        """
+        Open (or raise) the non-modal ConfigDialog.
+        Single instance — re-opening brings the existing dialog to front.
+        On first open (or re-open after close), immediately reload live
+        state from TinTin++ so the editor reflects what's actually running.
+        """
+        if self._config_dlg is not None and not self._config_dlg.isHidden():
+            self._config_dlg.raise_()
+            self._config_dlg.activateWindow()
+            # Refresh from tt++ each time the dialog is raised
+            if self._tt.running:
+                self._config_dlg.reload_from_tt()
+            return
+
+        s = self._active_session
+        config = {
+            # Always read from the live ButtonBar — session.buttons may be []
+            # meaning "use defaults", while the bar already has the real list.
+            "buttons":    self._buttons.get_buttons(),
+            "aliases":    getattr(s, 'aliases',    []) if s else [],
+            "actions":    getattr(s, 'actions',    []) if s else [],
+            "timers":     getattr(s, 'timers',     []) if s else [],
+            "highlights": getattr(s, 'highlights', []) if s else [],
+        }
+        self._config_dlg = ConfigDialog(config, self)
+
+        # Provide the loader factory so the dialog can pull live tt++ state
+        def _make_loader():
+            loader = TinTinConfigLoader(self._tt, self)
+            return loader
+        self._config_dlg.set_loader_factory(_make_loader)
+
+        self._config_dlg.saved.connect(self._on_config_saved)
+        self._config_dlg.show()
+
+        # Auto-load from tt++ immediately if it's running
+        if self._tt.running:
+            # Small delay so the dialog is fully painted before the
+            # status label updates
+            QTimer.singleShot(200, self._config_dlg.reload_from_tt)
+
+    def _on_config_saved(self, config: dict):
+        """
+        Receive saved config from ConfigDialog:
+          1. Push buttons into ButtonBar
+          2. Write the session config .tin file
+          3. Send #read to apply it live in tt++
+          4. Persist everything to session JSON
+        """
+        # Update button bar
+        self._buttons.blockSignals(True)
+        self._buttons.set_buttons(config.get("buttons", []))
+        self._buttons.blockSignals(False)
+
+        # Write config .tin file and reload it in tt++
+        if self._active_session is not None:
+            cfg_path = config_file_path(self._active_session.name)
+            write_config_file(cfg_path, config)
+            if self._tt.running:
+                self._tt.send(f"#read {{{cfg_path}}}")
+                self._output_local(
+                    f"\x1b[32m[Config saved → {cfg_path}]\x1b[0m\n"
+                )
+
+        # Update active session in memory then persist
+        if self._active_session is not None:
+            self._active_session.buttons    = config.get("buttons",    [])
+            self._active_session.aliases    = config.get("aliases",    [])
+            self._active_session.actions    = config.get("actions",    [])
+            self._active_session.timers     = config.get("timers",     [])
+            self._active_session.highlights = config.get("highlights", [])
+        self._save_panel_layout()
+
+    def _configure_buttons(self):
+        """Ctrl+B shortcut — open config dialog directly on the Buttons tab."""
+        self._open_config()
+        if self._config_dlg:
+            self._config_dlg._tabs.setCurrentIndex(0)
+
     def _change_font(self, delta: int):
         new_size = max(7, min(self._output.font_size + delta, 24))
         self._output.font_size = new_size
+        self._save_panel_layout()
 
     # ------------------------------------------------------------------
 
     def closeEvent(self, event):
+        # Collect EVERYTHING before touching the dialog or tt++
+        if self._active_session is not None:
+            # Flush any in-progress edit in all dialog tabs
+            if self._config_dlg is not None:
+                for tab in (
+                    self._config_dlg._buttons_tab,
+                    self._config_dlg._aliases_tab,
+                    self._config_dlg._actions_tab,
+                    self._config_dlg._timers_tab,
+                    self._config_dlg._highlights_tab,
+                ):
+                    tab.commit()
+                full_config = self._config_dlg.get_config()
+            else:
+                full_config = {
+                    "buttons":    self._buttons.get_buttons(),
+                    "aliases":    getattr(self._active_session, 'aliases',    []),
+                    "actions":    getattr(self._active_session, 'actions',    []),
+                    "timers":     getattr(self._active_session, 'timers',     []),
+                    "highlights": getattr(self._active_session, 'highlights', []),
+                }
+
+            # Update in-memory session with everything
+            self._active_session.buttons      = full_config.get("buttons",    [])
+            self._active_session.aliases      = full_config.get("aliases",    [])
+            self._active_session.actions      = full_config.get("actions",    [])
+            self._active_session.timers       = full_config.get("timers",     [])
+            self._active_session.highlights   = full_config.get("highlights", [])
+            self._active_session.panel_layout = self._right.get_layout()
+            self._active_session.font_size    = getattr(self._output, 'font_size', 0)
+
+            # Write the .tin config file
+            cfg_path = config_file_path(self._active_session.name)
+            write_config_file(cfg_path, full_config)
+
+        # Now safe to close dialog and stop tt++
+        if self._config_dlg is not None:
+            self._config_dlg.close()
         self._tt.stop()
-        self._buttons.save()
+
+        # Persist session to JSON
+        self._save_panel_layout()
+        if self._active_session is None:
+            self._buttons.save_global()
         super().closeEvent(event)
 
     def keyPressEvent(self, event: QKeyEvent):
