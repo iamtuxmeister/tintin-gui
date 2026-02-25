@@ -191,12 +191,10 @@ class _ScrollbackPane(_Pane):
         )
 
     def wheelEvent(self, event: QWheelEvent):
-        super().wheelEvent(event)
-        # If user scrolled down and hit the bottom, close the split
-        if event.angleDelta().y() < 0:
-            sb = self.verticalScrollBar()
-            if sb.value() >= sb.maximum() - 5:
-                self._ow.close_split()
+        # Wheel events are handled globally by _WheelRedirectFilter in
+        # main_window.py which calls OutputWidget._on_wheel. This handler
+        # is only reached if the filter is not installed (e.g. in tests).
+        self._ow._on_wheel(event.angleDelta().y())
 
 
 class OutputWidget(QWidget):
@@ -273,7 +271,8 @@ class OutputWidget(QWidget):
 
         # ── Scrollback — FIX 6: lazy ──────────────────────────────────
         if self._split_active:
-            # Split is open: write directly and trim
+            # Split is open: write directly, trim, then pin to bottom so
+            # new MUD output is always visible (matches live pane behaviour)
             self._scrollback.append_spans(spans)
             self._scrollback.trim_to(_SCROLLBACK_MAX)
         else:
@@ -355,10 +354,9 @@ class OutputWidget(QWidget):
     # ------------------------------------------------------------------
 
     def _on_wheel(self, delta_y: int):
-        """Called by _LivePane when user scrolls over it."""
-        if delta_y > 0:
-            # Scroll up over live pane — open split
-            if not self._split_active:
+        """Fallback handler for when the wheel filter is not installed."""
+        if not self._split_active:
+            if delta_y > 0:
                 self.open_split()
 
     def keyPressEvent(self, event: QKeyEvent):

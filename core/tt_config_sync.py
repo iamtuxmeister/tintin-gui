@@ -58,6 +58,8 @@ for _full, _canon in [
     ("#highlight", "#highlight"),
     ("#colour",    "#highlight"),    # British spelling variant
     ("#color",     "#highlight"),    # US alternative (older tt++ versions)
+    ("#variable",  "#variable"),
+    ("#var",       "#variable"),     # tt++ accepts #var as abbreviation
 ]:
     for _end in range(3, len(_full) + 1):
         _p = _full[:_end]
@@ -180,6 +182,7 @@ def parse_tin_file(path: str | Path, debug: bool = False) -> dict:
         "actions":    [],
         "timers":     [],
         "highlights": [],
+        "variables":  [],
     }
     try:
         text = Path(path).read_text(encoding="utf-8", errors="replace")
@@ -243,10 +246,19 @@ def parse_tin_file(path: str | Path, debug: bool = False) -> dict:
                     "bg":      bg,
                 })
 
+        elif canon == "#variable":
+            # #variable {name} {value} [{class}]
+            # Single-arg form #variable {name} also valid (clears variable)
+            if len(args) >= 1 and args[0].strip():
+                config["variables"].append({
+                    "name":  args[0].strip(),
+                    "value": args[1].strip() if len(args) >= 2 else "",
+                })
+
     log.debug(
-        "parse_tin_file results: %d aliases, %d actions, %d timers, %d highlights",
+        "parse_tin_file results: %d aliases, %d actions, %d timers, %d highlights, %d variables",
         len(config["aliases"]), len(config["actions"]),
-        len(config["timers"]),  len(config["highlights"]),
+        len(config["timers"]),  len(config["highlights"]), len(config["variables"]),
     )
     return config
 
@@ -300,6 +312,14 @@ def write_config_file(path: str | Path, config: dict):
         secs = t.get("interval", 30)
         if name and cmd and t.get("enabled", True):
             lines.append(f"#ticker {{{name}}} {{{cmd}}} {{{secs}}}")
+    lines.append("")
+
+    lines += ["#nop -- Variables", "#variable {}"]
+    for v in config.get("variables", []):
+        name  = v.get("name",  "").strip()
+        value = v.get("value", "").strip()
+        if name:
+            lines.append(f"#variable {{{name}}} {{{value}}}")
     lines.append("")
 
     lines += ["#nop -- Highlights", "#highlight {}"]

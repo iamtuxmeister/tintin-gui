@@ -114,6 +114,7 @@ class Session:
     actions:      list = field(default_factory=list)
     timers:       list = field(default_factory=list)
     highlights:   list = field(default_factory=list)
+    variables:    list = field(default_factory=list)
     panel_layout: dict = field(default_factory=dict)
     font_size:    int  = 0   # 0 = use application default (currently 11pt)
 
@@ -136,6 +137,7 @@ def _load_sessions() -> List[Session]:
             s.setdefault("actions",      [])
             s.setdefault("timers",       [])
             s.setdefault("highlights",   [])
+            s.setdefault("variables",    [])
             s.setdefault("panel_layout", {})
             s.setdefault("font_size",    0)   # 0 = use application default
             # Drop any keys that don't exist in the current Session dataclass
@@ -245,6 +247,7 @@ class _SessionEditor(QDialog):
             actions      = existing.actions      if existing else [],
             timers       = existing.timers       if existing else [],
             highlights   = existing.highlights   if existing else [],
+            variables    = existing.variables    if existing else [],
             panel_layout = existing.panel_layout if existing else {},
             font_size    = existing.font_size    if existing else 0,
         )

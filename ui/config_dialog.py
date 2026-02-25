@@ -756,6 +756,67 @@ class _HighlightsTab(_ListEditorTab):
         return cmds
 
 
+
+class _VariablesTab(_ListEditorTab):
+
+    def _make_editor(self, layout):
+        layout.addWidget(_lbl("Variable name"))
+        self._ed_name = QLineEdit()
+        self._ed_name.setPlaceholderText("e.g.  tank  or  autoAssist")
+        self._ed_name.textChanged.connect(self._live)
+        layout.addWidget(self._ed_name)
+
+        layout.addWidget(_lbl("Value"))
+        self._ed_value = QLineEdit()
+        self._ed_value.setPlaceholderText("e.g.  Frodo  or  0")
+        self._ed_value.textChanged.connect(self._live)
+        layout.addWidget(self._ed_value)
+
+        hint = _lbl(
+            "Sets a tt++ variable at session start.\n"
+            "Use ${name} to reference it in aliases and actions."
+        )
+        hint.setStyleSheet("color: #666; font-size: 9pt;")
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
+
+    def _live(self):
+        if 0 <= self._current < len(self._items):
+            self._items[self._current] = self._editor_to_dict()
+            self._refresh_current_label()
+
+    def _item_label(self, d):
+        name  = d.get("name",  "")
+        value = d.get("value", "")
+        return f"{name:20s}  =  {value}"
+
+    def _editor_to_dict(self):
+        return {
+            "name":  self._ed_name.text().strip(),
+            "value": self._ed_value.text().strip(),
+        }
+
+    def _dict_to_editor(self, d):
+        self._ed_name.blockSignals(True)
+        self._ed_value.blockSignals(True)
+        self._ed_name.setText(d.get("name",  ""))
+        self._ed_value.setText(d.get("value", ""))
+        self._ed_name.blockSignals(False)
+        self._ed_value.blockSignals(False)
+
+    def default_item(self):
+        return {"name": "", "value": ""}
+
+    def tintin_commands(self, items):
+        cmds = ["#variable {}"]   # clear all
+        for d in items:
+            name  = d.get("name",  "").strip()
+            value = d.get("value", "").strip()
+            if name:
+                cmds.append(f"#variable {{{name}}} {{{value}}}")
+        return cmds
+
+
 # ── Master ConfigDialog ───────────────────────────────────────────────
 
 class ConfigDialog(QDialog):
@@ -797,12 +858,15 @@ class ConfigDialog(QDialog):
         self._actions_tab    = _ActionsTab(config.get("actions",    []))
         self._timers_tab     = _TimersTab(config.get("timers",      []))
         self._highlights_tab = _HighlightsTab(config.get("highlights", []))
+        self._variables_tab  = _VariablesTab(config.get("variables",  []))
+        self._variables_tab  = _VariablesTab(config.get("variables",  []))
 
-        self._tabs.addTab(self._buttons_tab,    "Buttons")
-        self._tabs.addTab(self._aliases_tab,    "Aliases")
         self._tabs.addTab(self._actions_tab,    "Actions")
+        self._tabs.addTab(self._aliases_tab,    "Aliases")
+        self._tabs.addTab(self._variables_tab,  "Variables")
         self._tabs.addTab(self._timers_tab,     "Timers")
         self._tabs.addTab(self._highlights_tab, "Highlights")
+        self._tabs.addTab(self._buttons_tab,    "Buttons")
 
         # ── Bottom bar ────────────────────────────────────────────────
         sep = QFrame()
@@ -879,14 +943,17 @@ class ConfigDialog(QDialog):
         self._actions_tab    = _ActionsTab(config.get("actions",    []))
         self._timers_tab     = _TimersTab(config.get("timers",      []))
         self._highlights_tab = _HighlightsTab(config.get("highlights", []))
+        self._variables_tab  = _VariablesTab(config.get("variables",  []))
 
         # Replace tabs 1-4 (leave Buttons at index 0 untouched)
         current = self._tabs.currentIndex()
         for idx, (tab, title) in enumerate([
-            (self._aliases_tab,    "Aliases"),
             (self._actions_tab,    "Actions"),
+            (self._aliases_tab,    "Aliases"),
+            (self._variables_tab,  "Variables"),
             (self._timers_tab,     "Timers"),
             (self._highlights_tab, "Highlights"),
+            (self._buttons_tab,    "Buttons"),
         ], start=1):
             self._tabs.removeTab(idx)
             self._tabs.insertTab(idx, tab, title)
@@ -896,7 +963,8 @@ class ConfigDialog(QDialog):
             f"{len(config.get('aliases',    []))} aliases, "
             f"{len(config.get('actions',    []))} actions, "
             f"{len(config.get('timers',     []))} timers, "
-            f"{len(config.get('highlights', []))} highlights"
+            f"{len(config.get('highlights', []))} highlights",
+            f"{len(config.get('variables',  []))} variables"
         )
         self._set_status(f"Loaded from TinTin++ — {counts}")
         QTimer.singleShot(5000, lambda: self._set_status(""))
@@ -921,7 +989,7 @@ class ConfigDialog(QDialog):
     def _on_save(self):
         for tab in (self._buttons_tab, self._aliases_tab,
                     self._actions_tab, self._timers_tab,
-                    self._highlights_tab):
+                    self._highlights_tab, self._variables_tab):
             tab.commit()
         config = self.get_config()
         self.saved.emit(config)
@@ -936,6 +1004,7 @@ class ConfigDialog(QDialog):
             "actions":    self._actions_tab.get_items(),
             "timers":     self._timers_tab.get_items(),
             "highlights": self._highlights_tab.get_items(),
+            "variables":  self._variables_tab.get_items(),
         }
 
     def all_tintin_commands(self) -> list[str]:
@@ -945,6 +1014,7 @@ class ConfigDialog(QDialog):
         """
         cmds = []
         for tab in (self._aliases_tab, self._actions_tab,
-                    self._timers_tab, self._highlights_tab):
+                    self._timers_tab, self._highlights_tab,
+                    self._variables_tab):
             cmds.extend(tab.tintin_commands(tab.get_items()))
         return cmds

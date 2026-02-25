@@ -416,6 +416,64 @@ class _InputBar(QWidget):
         self._edit.setFocus()
 
 
+class _WheelRedirectFilter(QObject):
+    """
+    Application-level event filter that routes all mouse wheel events to
+    the scrollback pane (when open) regardless of which widget the mouse is
+    over.  We forward the raw QWheelEvent unchanged so Qt applies the OS
+    scroll direction (including natural/reverse scroll) exactly as it would
+    for any other widget — no manual direction math here.
+    """
+
+    def __init__(self, output_widget, parent=None):
+        super().__init__(parent)
+        self._output = output_widget
+
+    def eventFilter(self, obj, event):
+        if event.type() != QEvent.Type.Wheel:
+            return False
+
+        out = self._output
+        split_active = out._split_active
+        scrollback   = out._scrollback
+
+        # If the event is already targeted at the scrollback, let Qt handle
+        # it normally — no interception needed.
+        if obj is scrollback or obj is scrollback.viewport():
+            return False
+
+        sb = scrollback.verticalScrollBar()
+
+        if split_active:
+            # Use the raw pixel or angle delta Qt already computed for us.
+            # pixelDelta is set by trackpads; angleDelta by mice (120 units
+            # per notch).  Both already incorporate the OS natural-scroll
+            # direction — we just apply them directly to the scrollbar.
+            px = event.pixelDelta().y()
+            if px != 0:
+                sb.setValue(sb.value() - px)
+            else:
+                # angleDelta: 120 units = 1 notch.  Map to ~3 lines.
+                angle = event.angleDelta().y()
+                steps = angle / 120.0 * sb.singleStep() * 3
+                sb.setValue(sb.value() - int(steps))
+
+            # Close split when scrolled back to the very bottom
+            if sb.value() >= sb.maximum() - 5:
+                if (event.pixelDelta().y() < 0 or
+                        (event.pixelDelta().y() == 0 and event.angleDelta().y() < 0)):
+                    out.close_split()
+            return True
+
+        else:
+            # Split is closed — any upward scroll gesture opens it
+            opens = (event.pixelDelta().y() > 0 or
+                     (event.pixelDelta().y() == 0 and event.angleDelta().y() > 0))
+            if opens:
+                out.open_split()
+            return True
+
+
 class _InputFocusFilter(QObject):
     """
     Application-level event filter that redirects printable keypresses to
@@ -561,6 +619,10 @@ class MainWindow(QMainWindow):
         self._focus_filter = _InputFocusFilter(self._input, self)
         QApplication.instance().installEventFilter(self._focus_filter)
 
+        # ---- wheel filter — route all wheel events to the output widget ----
+        self._wheel_filter = _WheelRedirectFilter(self._output, self)
+        QApplication.instance().installEventFilter(self._wheel_filter)
+
         # ---- show session manager on startup; tt++ starts after selection ----
         QTimer.singleShot(100, self._show_session_manager)
 
@@ -658,6 +720,7 @@ class MainWindow(QMainWindow):
             self._active_session.actions    = cfg.get("actions",    self._active_session.actions)
             self._active_session.timers     = cfg.get("timers",     self._active_session.timers)
             self._active_session.highlights = cfg.get("highlights", self._active_session.highlights)
+            self._active_session.variables  = cfg.get("variables",  self._active_session.variables)
 
         self._active_session.panel_layout = self._right.get_layout()
         self._active_session.font_size    = getattr(self._output, 'font_size', 0)
@@ -794,11 +857,6 @@ class MainWindow(QMainWindow):
         view_menu.addAction(font_smaller)
 
         view_menu.addSeparator()
-        config_buttons_act = QAction("Configure &Buttons…", self)
-        config_buttons_act.setShortcut("Ctrl+B")
-        config_buttons_act.triggered.connect(self._configure_buttons)
-        view_menu.addAction(config_buttons_act)
-
         config_act = QAction("&Configuration…", self)
         config_act.setShortcut("Ctrl+,")
         config_act.triggered.connect(self._open_config)
@@ -869,6 +927,7 @@ class MainWindow(QMainWindow):
             "actions":    getattr(s, 'actions',    []) if s else [],
             "timers":     getattr(s, 'timers',     []) if s else [],
             "highlights": getattr(s, 'highlights', []) if s else [],
+            "variables":  getattr(s, 'variables',  []) if s else [],
         }
         self._config_dlg = ConfigDialog(config, self)
 
@@ -903,7 +962,11 @@ class MainWindow(QMainWindow):
         # Write config .tin file and reload it in tt++
         if self._active_session is not None:
             cfg_path = config_file_path(self._active_session.name)
-            write_config_file(cfg_path, config)
+            _has_content = any(
+                config.get(k) for k in ("aliases", "actions", "timers", "highlights", "variables")
+            )
+            if _has_content:
+                write_config_file(cfg_path, config)
             if self._tt.running:
                 self._tt.send(f"#read {{{cfg_path}}}")
                 self._output_local(
@@ -917,13 +980,8 @@ class MainWindow(QMainWindow):
             self._active_session.actions    = config.get("actions",    [])
             self._active_session.timers     = config.get("timers",     [])
             self._active_session.highlights = config.get("highlights", [])
+            self._active_session.variables  = config.get("variables",  [])
         self._save_panel_layout()
-
-    def _configure_buttons(self):
-        """Ctrl+B shortcut — open config dialog directly on the Buttons tab."""
-        self._open_config()
-        if self._config_dlg:
-            self._config_dlg._tabs.setCurrentIndex(0)
 
     def _change_font(self, delta: int):
         new_size = max(7, min(self._output.font_size + delta, 24))
@@ -953,6 +1011,7 @@ class MainWindow(QMainWindow):
                     "actions":    getattr(self._active_session, 'actions',    []),
                     "timers":     getattr(self._active_session, 'timers',     []),
                     "highlights": getattr(self._active_session, 'highlights', []),
+                    "variables":  getattr(self._active_session, 'variables',  []),
                 }
 
             # Update in-memory session with everything
@@ -961,12 +1020,18 @@ class MainWindow(QMainWindow):
             self._active_session.actions      = full_config.get("actions",    [])
             self._active_session.timers       = full_config.get("timers",     [])
             self._active_session.highlights   = full_config.get("highlights", [])
+            self._active_session.variables    = full_config.get("variables",  [])
             self._active_session.panel_layout = self._right.get_layout()
             self._active_session.font_size    = getattr(self._output, 'font_size', 0)
 
-            # Write the .tin config file
+            # Only write the .tin config file if there is actual content —
+            # never overwrite an existing file with empty lists.
             cfg_path = config_file_path(self._active_session.name)
-            write_config_file(cfg_path, full_config)
+            _has_content = any(
+                full_config.get(k) for k in ("aliases", "actions", "timers", "highlights", "variables")
+            )
+            if _has_content:
+                write_config_file(cfg_path, full_config)
 
         # Now safe to close dialog and stop tt++
         if self._config_dlg is not None:
