@@ -3,21 +3,26 @@ Session Manager — startup dialog for managing MUD connections.
 
 Stored in ~/.config/tintin-gui/sessions.json as a list of session dicts:
   {
-    "name":   "Toril",
-    "host":   "torilmud.org",
-    "port":   9999,
-    "script": "/home/user/scripts/toril.tin"   ← optional, "" if none
+    "name":         "Toril",
+    "host":         "torilmud.org",
+    "port":         9999,
+    "buttons":      [...],   ← per-session button definitions (list of dicts)
+    "panel_layout": {...}
   }
+
+The "buttons" field stores a list of button defs in the same format as
+ButtonBar uses internally:  [{"label": "Look", "command": "look", "color": "#2a5a3a"}, ...]
+An empty list means "use the ButtonBar defaults".
 
 On Connect:
   1. TinTin++ is started (if not already running) loading the session
-     script (if any) via the startup temp file mechanism.
   2. The dialog issues:  #session {name} {host} {port}
   3. MainWindow updates its title and status bar.
 """
 
 import json
 from pathlib import Path
+import dataclasses
 from dataclasses import dataclass, asdict, field
 from typing import List, Optional
 
@@ -31,7 +36,7 @@ from PyQt6.QtCore import Qt, pyqtSignal
 from PyQt6.QtGui  import QFont, QColor, QPalette
 
 
-_CONFIG_DIR  = Path.home() / ".config" / "tintin-gui"
+_CONFIG_DIR    = Path.home() / ".config" / "tintin-gui"
 _SESSIONS_FILE = _CONFIG_DIR / "sessions.json"
 
 _DARK = {
@@ -104,8 +109,15 @@ class Session:
     name:         str
     host:         str
     port:         int
-    script:       str  = ""   # path to .tin file, empty string = none
-    panel_layout: dict = field(default_factory=dict)  # right panel layout
+    script:       str  = ""    # path to a .tin file loaded on connect
+    buttons:      list = field(default_factory=list)
+    aliases:      list = field(default_factory=list)
+    actions:      list = field(default_factory=list)
+    timers:       list = field(default_factory=list)
+    highlights:   list = field(default_factory=list)
+    variables:    list = field(default_factory=list)
+    panel_layout: dict = field(default_factory=dict)
+    font_size:    int  = 0   # 0 = use application default (currently 11pt)
 
     def display(self) -> str:
         script_tag = "  📄" if self.script else ""
@@ -113,18 +125,38 @@ class Session:
 
 
 def _load_sessions() -> List[Session]:
+    # Known Session field names — filter JSON dicts to only these so that
+    # old, new, or otherwise mismatched files never cause Session(**s) to
+    # raise TypeError and silently swallow all saved data.
+    _SESSION_FIELDS = {f.name for f in dataclasses.fields(Session)}
+
     try:
         raw = json.loads(_SESSIONS_FILE.read_text())
-        return [Session(**s) for s in raw]
+        sessions = []
+        for s in raw:
+            s.setdefault("script",       "")
+            s.setdefault("buttons",      [])
+            s.setdefault("aliases",      [])
+            s.setdefault("actions",      [])
+            s.setdefault("timers",       [])
+            s.setdefault("highlights",   [])
+            s.setdefault("variables",    [])
+            s.setdefault("panel_layout", {})
+            s.setdefault("font_size",    0)
+            # Drop any keys not in the current dataclass so unknown fields
+            # from old/future versions never blow up Session(**s)
+            s = {k: v for k, v in s.items() if k in _SESSION_FIELDS}
+            sessions.append(Session(**s))
+        return sessions
     except Exception:
+        import traceback
+        traceback.print_exc()
         return []
 
 
 def _save_sessions(sessions: List[Session]):
     _CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-    _SESSIONS_FILE.write_text(
-        json.dumps([asdict(s) for s in sessions], indent=2)
-    )
+    _SESSIONS_FILE.write_text(json.dumps([asdict(s) for s in sessions], indent=2))
 
 
 class _SessionEditor(QDialog):
@@ -180,7 +212,6 @@ class _SessionEditor(QDialog):
 
         layout.addLayout(form)
 
-        # Separator
         sep = QFrame()
         sep.setFrameShape(QFrame.Shape.HLine)
         sep.setStyleSheet(f"color: {_DARK['border']};")
@@ -196,6 +227,7 @@ class _SessionEditor(QDialog):
         layout.addWidget(buttons)
 
     def _browse_script(self):
+        from pathlib import Path
         path, _ = QFileDialog.getOpenFileName(
             self, "Select TinTin++ script",
             str(Path.home()),
@@ -213,12 +245,27 @@ class _SessionEditor(QDialog):
             return
         self.accept()
 
-    def result_session(self) -> Session:
+    def result_session(self, existing: Optional[Session] = None) -> Session:
+        """
+        Return a new Session, preserving all runtime fields from existing.
+        The editor only touches name/host/port — everything else
+        (buttons, aliases, actions, timers, highlights, panel_layout,
+        font_size) is carried over unchanged.
+        """
         return Session(
-            name   = self._name.text().strip(),
-            host   = self._host.text().strip(),
-            port   = self._port.value(),
-            script = self._script.text().strip(),
+            name         = self._name.text().strip(),
+            host         = self._host.text().strip(),
+            port         = self._port.value(),
+            script       = self._script.text().strip(),
+            # Preserve all runtime/config fields from existing session
+            buttons      = existing.buttons      if existing else [],
+            aliases      = existing.aliases      if existing else [],
+            actions      = existing.actions      if existing else [],
+            timers       = existing.timers       if existing else [],
+            highlights   = existing.highlights   if existing else [],
+            variables    = existing.variables    if existing else [],
+            panel_layout = existing.panel_layout if existing else {},
+            font_size    = existing.font_size    if existing else 0,
         )
 
 
@@ -226,7 +273,6 @@ class _SessionList(QListWidget):
     """QListWidget that fires Enter/Return as a connect action."""
     def keyPressEvent(self, event):
         if event.key() in (Qt.Key.Key_Return, Qt.Key.Key_Enter):
-            # Walk up to SessionManager and call _on_connect
             p = self.parent()
             while p:
                 if isinstance(p, SessionManager):
@@ -271,7 +317,6 @@ class SessionManager(QDialog):
 
         self._sessions: List[Session] = _load_sessions()
 
-        # ── Layout ────────────────────────────────────────────────────
         root = QVBoxLayout(self)
         root.setContentsMargins(16, 16, 16, 16)
         root.setSpacing(10)
@@ -280,7 +325,6 @@ class SessionManager(QDialog):
         title.setStyleSheet(f"color: {_DARK['text']}; font-size: 13px; font-weight: bold;")
         root.addWidget(title)
 
-        # List + side buttons
         mid = QHBoxLayout()
         mid.setSpacing(10)
 
@@ -309,7 +353,6 @@ class SessionManager(QDialog):
 
         root.addLayout(mid, stretch=1)
 
-        # Bottom bar
         sep = QFrame()
         sep.setFrameShape(QFrame.Shape.HLine)
         sep.setStyleSheet(f"color: {_DARK['border']};")
@@ -319,7 +362,7 @@ class SessionManager(QDialog):
         self._btn_connect = QPushButton("Connect")
         self._btn_connect.setStyleSheet(_CONNECT_STYLE)
         self._btn_connect.setEnabled(False)
-        self._btn_connect.setDefault(True)   # Enter key triggers this button
+        self._btn_connect.setDefault(True)
         self._btn_connect.clicked.connect(self._on_connect)
 
         self._btn_cancel = QPushButton("Launch without connecting")
@@ -333,10 +376,6 @@ class SessionManager(QDialog):
 
         self._rebuild_list()
 
-    # ------------------------------------------------------------------
-    # List management
-    # ------------------------------------------------------------------
-
     def _rebuild_list(self):
         current = self._list.currentRow()
         self._list.clear()
@@ -344,15 +383,13 @@ class SessionManager(QDialog):
             item = QListWidgetItem(s.display())
             item.setData(Qt.ItemDataRole.UserRole, s)
             self._list.addItem(item)
-        # Restore selection
         if self._sessions:
-            row = min(current, len(self._sessions) - 1)
-            row = max(row, 0)
+            row = max(0, min(current, len(self._sessions) - 1))
             self._list.setCurrentRow(row)
         self._on_selection_change(self._list.currentRow())
 
     def _on_selection_change(self, row: int):
-        has = row >= 0 and row < len(self._sessions)
+        has = 0 <= row < len(self._sessions)
         self._btn_connect.setEnabled(has)
         self._btn_edit.setEnabled(has)
         self._btn_delete.setEnabled(has)
@@ -362,10 +399,6 @@ class SessionManager(QDialog):
         if 0 <= row < len(self._sessions):
             return self._sessions[row]
         return None
-
-    # ------------------------------------------------------------------
-    # Actions
-    # ------------------------------------------------------------------
 
     def _on_new(self):
         dlg = _SessionEditor(parent=self)
@@ -382,7 +415,8 @@ class SessionManager(QDialog):
         row = self._list.currentRow()
         dlg = _SessionEditor(session=s, parent=self)
         if dlg.exec():
-            self._sessions[row] = dlg.result_session()
+            # Pass existing session so buttons/panel_layout are preserved
+            self._sessions[row] = dlg.result_session(existing=s)
             _save_sessions(self._sessions)
             self._rebuild_list()
             self._list.setCurrentRow(row)

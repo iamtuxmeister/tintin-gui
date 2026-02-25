@@ -135,6 +135,20 @@ class _Pane(QTextEdit):
             self._line_count += text.count('\n')
             self._cur.insertText(text, _make_fmt(span.style, self._font))
 
+    def prepend_spans(self, spans: list):
+        """Insert spans at the very top of the document (for backfill)."""
+        c = QTextCursor(self.document())
+        c.movePosition(QTextCursor.MoveOperation.Start)
+        for span in spans:
+            text = span.text.replace('\r\n', '\n').replace('\r', '')
+            if not text:
+                continue
+            self._line_count += text.count('\n')
+            c.insertText(text, _make_fmt(span.style, self._font))
+            # Advance past what we just inserted so the next span follows it
+            # (cursor stays at the end of the inserted block, which is correct
+            # since we're building top-to-bottom within this call)
+
     def trim_to(self, max_lines: int):
         excess = self._line_count - max_lines
         if excess <= 0:
@@ -209,24 +223,40 @@ class OutputWidget(QWidget):
         toggle_split()     — flip state
         font_size          — int property
 
-    FIX 6 (scrollback lazy rendering):
-    While the scrollback pane is hidden, incoming spans are buffered in
-    _pending_spans (capped at _SCROLLBACK_MAX lines worth).  When
-    open_split() is called, the buffer is flushed to the scrollback pane
-    before it becomes visible.  This eliminates the double-render cost
-    during normal play when only the live pane is showing.
+    Scrollback open strategy
+    ------------------------
+    Two logical regions are maintained while the split is closed:
+
+      _pending_spans  — older history (oldest first, capped at
+                        _SCROLLBACK_MAX lines total).
+      _tail_spans     — the most recent _TAIL_LINES lines, extracted
+                        from _pending_spans at the moment open_split()
+                        is called.
+
+    On open_split():
+      1. _tail_spans is written synchronously (~100 lines) and the pane
+         is pinned to the bottom.  The user sees recent content instantly.
+      2. A zero-interval QTimer then *prepends* _pending_spans in chunks
+         from the end (newest older → oldest), so the document builds up
+         above the tail with the correct chronological order.
+
+    On close_split() during a prepend flush:
+      The timer is cancelled, the scrollback document is cleared, and
+      _split_tail is restored to _pending_spans so the full buffer is
+      consistent for the next open.
     """
 
-    # Rough line estimate per span batch for the pending buffer cap.
-    # We cap the pending buffer at SCROLLBACK_MAX lines to bound memory.
+    _TAIL_LINES       = 100    # lines written synchronously on open
+    _FLUSH_CHUNK      = 300    # spans prepended per event-loop tick
     _PENDING_LINE_CAP = _SCROLLBACK_MAX
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self._parser       = AnsiParser()
         self._split_active = False
+        self._flush_timer  = None    # QTimer used during async prepend
+        self._split_tail: list = []  # tail saved during in-progress flush
 
-        # FIX 6: pending spans accumulated while scrollback is hidden
         self._pending_spans: list[AnsiSpan] = []
         self._pending_lines: int            = 0
 
@@ -240,7 +270,6 @@ class OutputWidget(QWidget):
             "QSplitter::handle { background: #3c3c50; }"
         )
 
-        # FIX 3: pass self so panes hold a direct reference, not a name-walk
         self._scrollback = _ScrollbackPane(self)
         self._scrollback.setVisible(False)
 
@@ -269,25 +298,21 @@ class OutputWidget(QWidget):
         self._live.trim_to(_LIVE_MAX_LINES)
         self._live.pin_to_bottom()
 
-        # ── Scrollback — FIX 6: lazy ──────────────────────────────────
+        # ── Scrollback ────────────────────────────────────────────────
         if self._split_active:
-            # Split is open: write directly, trim, then pin to bottom so
-            # new MUD output is always visible (matches live pane behaviour)
+            # New content always goes to the bottom of the scrollback.
+            # The prepend timer is adding old history above the tail
+            # concurrently, which is fine — live content belongs at the end.
             self._scrollback.append_spans(spans)
             self._scrollback.trim_to(_SCROLLBACK_MAX)
         else:
-            # Split is hidden: buffer spans, cap by line count
             self._pending_spans.extend(spans)
             for span in spans:
                 self._pending_lines += span.text.count('\n')
-
-            # Keep the pending buffer bounded so memory doesn't grow unbounded
-            # during a long play session with the split never opened.
             if self._pending_lines > self._PENDING_LINE_CAP:
                 self._trim_pending()
 
     def _trim_pending(self):
-        """Drop oldest spans from the pending buffer to stay within cap."""
         excess = self._pending_lines - self._PENDING_LINE_CAP
         while self._pending_spans and excess > 0:
             dropped = self._pending_spans.pop(0)
@@ -295,15 +320,95 @@ class OutputWidget(QWidget):
             self._pending_lines -= dropped.text.count('\n')
         self._pending_lines = max(0, self._pending_lines)
 
-    def _flush_pending_to_scrollback(self):
-        """Flush buffered spans into the scrollback pane, then clear buffer."""
-        if self._pending_spans:
-            self._scrollback.append_spans(self._pending_spans)
+    # ------------------------------------------------------------------
+    # Tail helpers
+    # ------------------------------------------------------------------
+
+    def _split_off_tail(self) -> tuple[list, list]:
+        """
+        Partition _pending_spans into (older, tail) where tail holds the
+        last _TAIL_LINES lines.  Returns (older_spans, tail_spans).
+        """
+        lines = 0
+        for i in range(len(self._pending_spans) - 1, -1, -1):
+            lines += self._pending_spans[i].text.count('\n')
+            if lines >= self._TAIL_LINES:
+                return self._pending_spans[:i], self._pending_spans[i:]
+        # Everything fits inside the tail window
+        return [], list(self._pending_spans)
+
+    # ------------------------------------------------------------------
+    # Async prepend flush
+    # ------------------------------------------------------------------
+
+    def _start_prepend_flush(self):
+        if self._flush_timer is not None:
+            return
+        self._flush_timer = QTimer(self)
+        self._flush_timer.setSingleShot(False)
+        self._flush_timer.setInterval(0)
+        self._flush_timer.timeout.connect(self._prepend_chunk)
+        self._flush_timer.start()
+
+    def _prepend_chunk(self):
+        """
+        Take a chunk from the END of _pending_spans and prepend it to the
+        scrollback document.  Processing end-first and prepending each time
+        ensures chronological order: oldest ends up at the document top.
+
+        After each prepend the scrollbar is shifted by the exact pixel height
+        that was added above, so whatever the user is reading stays stationary.
+        If they are at the bottom (just opened the split) this naturally keeps
+        them at the bottom.  If they have scrolled up it preserves their position.
+        """
+        if not self._pending_spans:
+            self._flush_timer.stop()
+            self._flush_timer.deleteLater()
+            self._flush_timer = None
+            self._split_tail = []   # tail is now part of the document
             self._scrollback.trim_to(_SCROLLBACK_MAX)
-            self._pending_spans.clear()
-            self._pending_lines = 0
+            return
+
+        sb      = self._scrollback.verticalScrollBar()
+        old_max = sb.maximum()
+        old_val = sb.value()
+
+        chunk = self._pending_spans[-self._FLUSH_CHUNK:]
+        del self._pending_spans[-self._FLUSH_CHUNK:]
+        for span in chunk:
+            self._pending_lines -= span.text.count('\n')
+        self._pending_lines = max(0, self._pending_lines)
+
+        self._scrollback.prepend_spans(chunk)
+
+        # Compensate for the height added at the top so the viewport is stable
+        new_max = sb.maximum()
+        sb.setValue(old_val + (new_max - old_max))
+
+    def _stop_flush(self):
+        """Cancel an in-progress flush and restore buffer consistency."""
+        if self._flush_timer is None:
+            return
+        self._flush_timer.stop()
+        self._flush_timer.deleteLater()
+        self._flush_timer = None
+        # The scrollback has a partial write (tail + some prepended chunks).
+        # Clear it and put the tail back so the next open starts fresh.
+        self._scrollback.clear()
+        self._scrollback._line_count = 0
+        if self._split_tail:
+            self._pending_spans.extend(self._split_tail)
+            for span in self._split_tail:
+                self._pending_lines += span.text.count('\n')
+            self._split_tail = []
+
+    # ------------------------------------------------------------------
+    # Split open / close / clear
+    # ------------------------------------------------------------------
 
     def clear(self):
+        self._stop_flush()
+        self._split_tail = []
         for pane in (self._live, self._scrollback):
             pane.clear()
             pane._line_count = 0
@@ -314,22 +419,29 @@ class OutputWidget(QWidget):
         if self._split_active:
             return
         self._split_active = True
-
-        # FIX 6: flush buffered history before showing scrollback
-        self._flush_pending_to_scrollback()
-
         self._scrollback.setVisible(True)
-        # Position scrollback near the bottom so context is visible
-        self._scrollback.pin_to_bottom()
-        # Defer re-pin of live pane — Qt resizes it when the splitter shows
-        # the scrollback pane, which shifts the viewport before our cursor
-        # anchor takes effect.  One event-loop cycle is enough for the
-        # layout to settle, then we re-pin cleanly.
+
+        if self._pending_spans:
+            older, tail = self._split_off_tail()
+            self._split_tail      = tail
+            self._pending_spans   = older
+            self._pending_lines   = sum(s.text.count('\n') for s in older)
+
+            # Write the tail synchronously — instant, ~100 lines
+            self._scrollback.append_spans(tail)
+            self._scrollback.pin_to_bottom()
+
+            if self._pending_spans:
+                self._start_prepend_flush()
+        else:
+            self._scrollback.pin_to_bottom()
+
         QTimer.singleShot(0, self._live.pin_to_bottom)
 
     def close_split(self):
         if not self._split_active:
             return
+        self._stop_flush()
         self._split_active = False
         self._scrollback.setVisible(False)
         self._live.pin_to_bottom()

@@ -29,6 +29,7 @@ Key parsing notes
 import logging
 import os
 import re
+import time
 from pathlib import Path
 
 from PyQt6.QtCore import QTimer, QObject, pyqtSignal
@@ -161,6 +162,30 @@ def _join_directives(text: str) -> list[str]:
     return directives
 
 
+# ── GUI protocol helpers ──────────────────────────────────────────────
+# Matches the body written by tintin_commands() in _ActionsTab when a
+# gui_target is set.  Two forms:
+#   #showme {##GUI##<target>##%0}
+#   <cmd>;#showme {##GUI##<target>##%0}
+_GUI_ACTION_RE = re.compile(
+    r'(?:(.+?);)?#showme\s*\{##GUI##([^#]+)##[^}]+\}',
+    re.IGNORECASE,
+)
+
+
+def _extract_gui_target(raw_cmd: str) -> tuple[str, str]:
+    """
+    Return (gui_target, clean_command) by stripping the ##GUI## showme wrapper.
+    If the command doesn't contain the wrapper, returns ("", raw_cmd).
+    """
+    m = _GUI_ACTION_RE.fullmatch(raw_cmd.strip())
+    if m:
+        clean  = (m.group(1) or "").strip()
+        target = (m.group(2) or "").strip()
+        return target, clean
+    return "", raw_cmd
+
+
 # ── Parser ────────────────────────────────────────────────────────────
 
 def parse_tin_file(path: str | Path, debug: bool = False) -> dict:
@@ -208,6 +233,8 @@ def parse_tin_file(path: str | Path, debug: bool = False) -> dict:
 
         elif canon == "#action":
             # #action {pattern} {command} {priority} [{class}]
+            # Command may be wrapped as: #showme {##GUI##<target>##<cmd>}
+            # or: <cmd>;#showme {##GUI##<target>##%0}
             if len(args) >= 2 and args[0].strip():
                 priority = 5
                 if len(args) >= 3:
@@ -215,11 +242,14 @@ def parse_tin_file(path: str | Path, debug: bool = False) -> dict:
                         priority = int(args[2].strip())
                     except ValueError:
                         pass
+                raw_cmd = args[1].strip()
+                gui_target, clean_cmd = _extract_gui_target(raw_cmd)
                 config["actions"].append({
-                    "pattern":  args[0].strip(),
-                    "command":  args[1].strip(),
-                    "priority": priority,
-                    "enabled":  True,
+                    "pattern":    args[0].strip(),
+                    "command":    clean_cmd,
+                    "priority":   priority,
+                    "enabled":    True,
+                    "gui_target": gui_target,
                 })
 
         elif canon == "#ticker":
@@ -298,11 +328,19 @@ def write_config_file(path: str | Path, config: dict):
 
     lines += ["#nop -- Actions", "#action {}"]
     for a in config.get("actions", []):
-        pat = a.get("pattern", "").strip()
-        cmd = a.get("command", "").strip()
-        pri = a.get("priority", 5)
+        pat    = a.get("pattern", "").strip()
+        cmd    = a.get("command", "").strip()
+        pri    = a.get("priority", 5)
+        target = a.get("gui_target", "").strip()
         if pat and a.get("enabled", True):
-            lines.append(f"#action {{{pat}}} {{{cmd}}} {{{pri}}}")
+            if target:
+                # Wrap with ##GUI## showme so the GUI intercepts it
+                body = f"#showme {{##GUI##{target}##%0}}"
+                if cmd:
+                    body = f"{cmd};{body}"
+                lines.append(f"#action {{{pat}}} {{{body}}} {{{pri}}}")
+            else:
+                lines.append(f"#action {{{pat}}} {{{cmd}}} {{{pri}}}")
     lines.append("")
 
     lines += ["#nop -- Timers", "#ticker {}"]
@@ -339,6 +377,51 @@ def write_config_file(path: str | Path, config: dict):
 
 
 # ── Live sync from a running tt++ process ────────────────────────────
+
+def dump_sync(tt_process, timeout: float = 3.0) -> dict | None:
+    """
+    Synchronously ask TinTin++ to dump its live config and return the
+    parsed result.  Blocks for up to *timeout* seconds.
+
+    Returns a config dict on success, or None if tt++ isn't running or
+    the file doesn't appear within the timeout.
+
+    Use this at application exit where the event loop is no longer
+    running and the async TinTinConfigLoader cannot be used.
+    """
+    if not getattr(tt_process, 'running', False):
+        return None
+
+    path = str(_WRITE_TMP)
+    _CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+
+    # Remove any stale file from a previous dump
+    try:
+        os.unlink(path)
+    except FileNotFoundError:
+        pass
+
+    tt_process.send(f"#write {{{path}}}")
+
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        time.sleep(0.05)
+        if os.path.exists(path):
+            try:
+                if os.path.getsize(path) > 0:
+                    break
+            except OSError:
+                pass
+    else:
+        return None   # timed out
+
+    config = parse_tin_file(path)
+    try:
+        os.unlink(path)
+    except OSError:
+        pass
+    return config
+
 
 class TinTinConfigLoader(QObject):
     """

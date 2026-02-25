@@ -20,6 +20,16 @@ The horizontal splitter between OutputWidget and MapWidget is user-draggable.
 
 import os
 import re as _re   # FIX 1: single module-level import, not repeated in hot path
+
+# ── ##GUI## inter-process protocol ────────────────────────────────────
+# TinTin++ actions emit:  #showme {##GUI##<target>##<value>}
+# The GUI intercepts these lines, routes them to named widgets, and
+# suppresses them from the visible output stream.
+#
+# Reserved targets:
+#   status_line  → the thin status bar above the button bar
+#   <any name>   → TextPane in RightPanel with that title
+_GUI_RE = _re.compile(r'^##GUI##([^#\r\n]+)##(.+)$')
 import sys
 import collections as _collections
 
@@ -35,7 +45,7 @@ from core.tintin_process_compat import TinTinProcess
 from core.map_parser        import MapGraph, try_parse_gmcp_line
 from core.tt_config_sync    import (
     TinTinConfigLoader, config_file_path,
-    parse_tin_file, write_config_file,
+    parse_tin_file, write_config_file, dump_sync,
 )
 from ui.output_widget    import OutputWidget
 from ui.map_widget       import MapWidget
@@ -586,8 +596,24 @@ class MainWindow(QMainWindow):
         self._input   = _InputBar(self._send_command)
         self._buttons = ButtonBar()
 
+        # Thin status line that TinTin++ actions can write to via ##GUI##
+        self._gui_status = QLabel("")
+        self._gui_status.setFixedHeight(20)
+        self._gui_status.setStyleSheet(
+            "QLabel {"
+            "  background: #0a0a14;"
+            "  color: #99bbcc;"
+            "  font-family: Monospace;"
+            "  font-size: 9pt;"
+            "  padding: 0 8px;"
+            "  border-top: 1px solid #1e1e2e;"
+            "}"
+        )
+        self._gui_status.setVisible(False)   # hidden until first write
+
         main_layout.addWidget(self._h_split, stretch=1)
         main_layout.addWidget(self._input)
+        main_layout.addWidget(self._gui_status)
         main_layout.addWidget(self._buttons)
 
         # ---- status bar ---------------------------------------------
@@ -698,48 +724,22 @@ class MainWindow(QMainWindow):
         QTimer.singleShot(500, self._restart_and_reconnect)
 
     def _save_panel_layout(self):
-        """Persist right-panel layout, buttons, font size, and all config."""
+        """Persist right-panel layout, buttons, font size, and all config to session JSON."""
         if self._active_session is None:
             return
 
-        # Collect current state into the in-memory session object.
-        # self._active_session is the single source of truth; callers
-        # are responsible for updating it before calling here.
-        # We also pick up anything the open dialog may have that hasn't
-        # been emitted via saved() yet.
-        if self._config_dlg is not None and not self._config_dlg.isHidden():
-            for tab in (self._config_dlg._aliases_tab,
-                        self._config_dlg._actions_tab,
-                        self._config_dlg._timers_tab,
-                        self._config_dlg._highlights_tab,
-                        self._config_dlg._buttons_tab):
-                tab.commit()
-            cfg = self._config_dlg.get_config()
-            self._active_session.buttons    = cfg.get("buttons",    self._active_session.buttons)
-            self._active_session.aliases    = cfg.get("aliases",    self._active_session.aliases)
-            self._active_session.actions    = cfg.get("actions",    self._active_session.actions)
-            self._active_session.timers     = cfg.get("timers",     self._active_session.timers)
-            self._active_session.highlights = cfg.get("highlights", self._active_session.highlights)
-            self._active_session.variables  = cfg.get("variables",  self._active_session.variables)
-
+        # Sync live state into the in-memory session object.
+        # Callers are responsible for updating alias/action/timer/etc fields
+        # on _active_session before calling here.  We always take buttons and
+        # layout directly from the live widgets so right-click edits are captured.
         self._active_session.panel_layout = self._right.get_layout()
         self._active_session.font_size    = getattr(self._output, 'font_size', 0)
-        # Always sync buttons from the live bar (covers edits made outside the dialog)
         self._active_session.buttons      = self._buttons.get_buttons()
 
         # Write to disk: load existing sessions, replace matching entry, save back.
-        import sys, traceback
-        print(
-            f"[_save_panel_layout] saving '{self._active_session.name}': "
-            f"buttons={len(self._active_session.buttons)}, "
-            f"font_size={self._active_session.font_size}",
-            file=sys.stderr,
-        )
         try:
             sessions = _load_sessions()
-            print(f"[_save_panel_layout] _load_sessions returned {len(sessions)} sessions", file=sys.stderr)
         except Exception:
-            traceback.print_exc(file=sys.stderr)
             sessions = []
 
         matched = False
@@ -749,14 +749,12 @@ class MainWindow(QMainWindow):
                 matched = True
                 break
         if not matched:
-            print(f"[_save_panel_layout] session not found in list, appending", file=sys.stderr)
             sessions.append(self._active_session)
 
         try:
             _save_sessions(sessions)
-            print(f"[_save_panel_layout] _save_sessions completed OK", file=sys.stderr)
-        except Exception:
-            traceback.print_exc(file=sys.stderr)
+        except Exception as e:
+            self._output_local(f"\x1b[31m[Save error] {e}\x1b[0m\n")
 
     def _restart_and_reconnect(self):
         # tt++ is dead — just show the session manager; it will launch
@@ -769,23 +767,37 @@ class MainWindow(QMainWindow):
 
     def _send_command(self, text: str):
         self._tt.send(text)
-        # Echo locally so you see what you typed
-        self._output_local(f"\n\x1b[90m> {text}\x1b[0m\n")
 
     # FIX 1: removed `import re as _re` that was here inside the method body.
     # The module-level import at the top of the file is used directly.
     def _on_tt_output(self, data: bytes):
-        """Receive raw bytes from TinTin++ — parse, render, check for GMCP."""
-        # Pass to output widget (handles ANSI parsing internally)
-        self._output.feed_raw(data)
+        """Receive raw bytes from TinTin++ — parse, render, check for GMCP/GUI."""
+        # ── ##GUI## intercept ──────────────────────────────────────────
+        # Scan lines before rendering.  Lines matching ##GUI##<target>##<value>
+        # are consumed here and never forwarded to the output pane.
+        text_for_gui = data.decode("utf-8", errors="replace")
+        clean_lines  = []
+        for line in text_for_gui.splitlines(keepends=True):
+            m = _GUI_RE.match(line.rstrip("\r\n"))
+            if m:
+                self._dispatch_gui_msg(m.group(1).strip(), m.group(2).strip())
+            else:
+                clean_lines.append(line)
 
-        # Feed plain text to tab completer (strip ANSI before word extraction)
-        plain = _re.sub(rb'\x1b\[[^a-zA-Z]*[a-zA-Z]', b'', data)
-        plain = _re.sub(rb'\x1b.', b'', plain)
-        self._input.feed_completion(plain.decode('utf-8', errors='replace'))
+        # Rebuild bytes with gui lines removed
+        clean_data = "".join(clean_lines).encode("utf-8", errors="replace")
+
+        # Pass cleaned output to the output widget
+        if clean_data:
+            self._output.feed_raw(clean_data)
+
+            # Feed plain text to tab completer (strip ANSI before word extraction)
+            plain = _re.sub(rb'\x1b\[[^a-zA-Z]*[a-zA-Z]', b'', clean_data)
+            plain = _re.sub(rb'\x1b.', b'', plain)
+            self._input.feed_completion(plain.decode('utf-8', errors='replace'))
 
         # Check for GMCP room data embedded in the text stream
-        lines = data.decode("utf-8", errors="replace").splitlines()
+        lines = text_for_gui.splitlines()
         for line in lines:
             result = try_parse_gmcp_line(line)
             if result:
@@ -797,6 +809,25 @@ class MainWindow(QMainWindow):
                     self._room_label.setText(f"[{vnum}] {name}")
                     if not self._map_timer.isActive():
                         self._map_timer.start()
+
+    def _dispatch_gui_msg(self, target: str, value: str):
+        """Route a ##GUI## message to the appropriate widget."""
+        if target == "status_line":
+            self._gui_status.setText(value)
+            self._gui_status.setVisible(True)
+            return
+
+        # Try named TextPane in the right panel
+        pane = self._right.get_text_pane(target)
+        if pane is not None:
+            pane.feed(value + "\n")
+            return
+
+        # Unknown target — show a one-time warning in the output
+        self._output_local(
+            f"\x1b[33m[GUI] Unknown target '{target}' — "
+            f"check Actions config\x1b[0m\n"
+        )
 
     def _output_local(self, text: str):
         """Inject a local (non-MUD) message into the output widget."""
@@ -929,7 +960,15 @@ class MainWindow(QMainWindow):
             "highlights": getattr(s, 'highlights', []) if s else [],
             "variables":  getattr(s, 'variables',  []) if s else [],
         }
-        self._config_dlg = ConfigDialog(config, self)
+
+        # Build the list of GUI targets the actions editor can target:
+        #   "status_line"  → the thin bar above the button bar
+        #   <pane title>   → any named TextPane in the right panel
+        gui_targets = ["status_line"] + [
+            p.title for p in self._right.all_text_panes()
+        ]
+
+        self._config_dlg = ConfigDialog(config, self, gui_targets=gui_targets)
 
         # Provide the loader factory so the dialog can pull live tt++ state
         def _make_loader():
@@ -991,9 +1030,16 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------
 
     def closeEvent(self, event):
-        # Collect EVERYTHING before touching the dialog or tt++
         if self._active_session is not None:
-            # Flush any in-progress edit in all dialog tabs
+            # ── 1. Dump live tt++ state ───────────────────────────────
+            # Ask the running TinTin++ for its current aliases, actions,
+            # timers, highlights and variables so that anything the user
+            # typed directly into the input line is captured.
+            live = {}
+            if self._tt.running:
+                live = dump_sync(self._tt, timeout=3.0) or {}
+
+            # ── 2. Collect GUI-side config ────────────────────────────
             if self._config_dlg is not None:
                 for tab in (
                     self._config_dlg._buttons_tab,
@@ -1001,11 +1047,12 @@ class MainWindow(QMainWindow):
                     self._config_dlg._actions_tab,
                     self._config_dlg._timers_tab,
                     self._config_dlg._highlights_tab,
+                    self._config_dlg._variables_tab,
                 ):
                     tab.commit()
-                full_config = self._config_dlg.get_config()
+                gui_config = self._config_dlg.get_config()
             else:
-                full_config = {
+                gui_config = {
                     "buttons":    self._buttons.get_buttons(),
                     "aliases":    getattr(self._active_session, 'aliases',    []),
                     "actions":    getattr(self._active_session, 'actions',    []),
@@ -1014,31 +1061,43 @@ class MainWindow(QMainWindow):
                     "variables":  getattr(self._active_session, 'variables',  []),
                 }
 
-            # Update in-memory session with everything
-            self._active_session.buttons      = full_config.get("buttons",    [])
-            self._active_session.aliases      = full_config.get("aliases",    [])
-            self._active_session.actions      = full_config.get("actions",    [])
-            self._active_session.timers       = full_config.get("timers",     [])
-            self._active_session.highlights   = full_config.get("highlights", [])
-            self._active_session.variables    = full_config.get("variables",  [])
+            # ── 3. Merge: live tt++ wins for script-managed keys ──────
+            # The live dump reflects everything currently in tt++ memory,
+            # including anything typed directly at the input line.
+            # Buttons are GUI-only and always come from the bar.
+            merged = {
+                "buttons":    gui_config.get("buttons", []),
+                "aliases":    live.get("aliases",    gui_config.get("aliases",    [])),
+                "actions":    live.get("actions",    gui_config.get("actions",    [])),
+                "timers":     live.get("timers",     gui_config.get("timers",     [])),
+                "highlights": live.get("highlights", gui_config.get("highlights", [])),
+                "variables":  live.get("variables",  gui_config.get("variables",  [])),
+            }
+
+            # ── 4. Update in-memory session ───────────────────────────
+            self._active_session.buttons      = merged["buttons"]
+            self._active_session.aliases      = merged["aliases"]
+            self._active_session.actions      = merged["actions"]
+            self._active_session.timers       = merged["timers"]
+            self._active_session.highlights   = merged["highlights"]
+            self._active_session.variables    = merged["variables"]
             self._active_session.panel_layout = self._right.get_layout()
             self._active_session.font_size    = getattr(self._output, 'font_size', 0)
 
-            # Only write the .tin config file if there is actual content —
-            # never overwrite an existing file with empty lists.
+            # ── 5. Write .tin config file ─────────────────────────────
             cfg_path = config_file_path(self._active_session.name)
             _has_content = any(
-                full_config.get(k) for k in ("aliases", "actions", "timers", "highlights", "variables")
+                merged.get(k) for k in ("aliases", "actions", "timers", "highlights", "variables")
             )
             if _has_content:
-                write_config_file(cfg_path, full_config)
+                write_config_file(cfg_path, merged)
 
-        # Now safe to close dialog and stop tt++
+        # Close dialog and stop tt++ (order matters — dump before stop)
         if self._config_dlg is not None:
             self._config_dlg.close()
         self._tt.stop()
 
-        # Persist session to JSON
+        # Persist session JSON
         self._save_panel_layout()
         if self._active_session is None:
             self._buttons.save_global()

@@ -488,6 +488,11 @@ class _AliasesTab(_ListEditorTab):
 
 class _ActionsTab(_ListEditorTab):
 
+    def __init__(self, items: list, gui_targets: list = None, parent=None):
+        # Store before super().__init__ because _make_editor is called from there
+        self._gui_targets: list = gui_targets or []
+        super().__init__(items, parent)
+
     def _make_editor(self, layout):
         layout.addWidget(_lbl("Pattern  (regex or plain text)"))
         self._ed_pattern = QLineEdit()
@@ -500,6 +505,21 @@ class _ActionsTab(_ListEditorTab):
         self._ed_cmd.setPlaceholderText("e.g.  eat bread  or  say Hello %1!")
         self._ed_cmd.textChanged.connect(self._live)
         layout.addWidget(self._ed_cmd)
+
+        # ── GUI Target ────────────────────────────────────────────────
+        layout.addWidget(_lbl("GUI Target  (optional — sends output to a GUI widget)"))
+        from PyQt6.QtWidgets import QComboBox
+        self._ed_target = QComboBox()
+        self._ed_target.addItem("(none)")
+        for t in self._gui_targets:
+            self._ed_target.addItem(t)
+        self._ed_target.setToolTip(
+            "If set, the command output is sent to this GUI widget via\n"
+            "#showme {##GUI##<target>##<command>}\n"
+            "instead of being executed as a normal TinTin++ command."
+        )
+        self._ed_target.currentIndexChanged.connect(self._live)
+        layout.addWidget(self._ed_target)
 
         row = QHBoxLayout()
         row.setSpacing(12)
@@ -519,7 +539,8 @@ class _ActionsTab(_ListEditorTab):
 
         hint = _lbl(
             "Tip: use %0 for the full matched line, %1 %2 … for groups.\n"
-            "Braces {} make TinTin++ match literally."
+            "Braces {} make TinTin++ match literally.\n"
+            "GUI Target: output goes to the named panel/status bar instead of MUD."
         )
         hint.setStyleSheet("color: #666; font-size: 9pt;")
         hint.setWordWrap(True)
@@ -533,40 +554,58 @@ class _ActionsTab(_ListEditorTab):
     def _item_label(self, d):
         pat = d.get("pattern", "")
         cmd = d.get("command", "")
+        target = d.get("gui_target", "")
         enabled = "" if d.get("enabled", True) else "  [OFF]"
-        return f"{pat:30s}  →  {cmd}{enabled}"
+        suffix = f"  →GUI:{target}" if target else ""
+        return f"{pat:30s}  →  {cmd}{suffix}{enabled}"
 
     def _editor_to_dict(self):
+        target = self._ed_target.currentText()
         return {
-            "pattern":  self._ed_pattern.text().strip(),
-            "command":  self._ed_cmd.text().strip(),
-            "priority": self._ed_pri.value(),
-            "enabled":  self._ed_enabled.isChecked(),
+            "pattern":    self._ed_pattern.text().strip(),
+            "command":    self._ed_cmd.text().strip(),
+            "priority":   self._ed_pri.value(),
+            "enabled":    self._ed_enabled.isChecked(),
+            "gui_target": "" if target == "(none)" else target,
         }
 
     def _dict_to_editor(self, d):
         self._ed_pattern.blockSignals(True)
         self._ed_cmd.blockSignals(True)
+        self._ed_target.blockSignals(True)
         self._ed_pattern.setText(d.get("pattern", ""))
         self._ed_cmd.setText(d.get("command", ""))
         self._ed_pri.setValue(d.get("priority", 5))
         self._ed_enabled.setChecked(d.get("enabled", True))
+        target = d.get("gui_target", "")
+        idx = self._ed_target.findText(target) if target else 0
+        self._ed_target.setCurrentIndex(max(0, idx))
         self._ed_pattern.blockSignals(False)
         self._ed_cmd.blockSignals(False)
+        self._ed_target.blockSignals(False)
 
     def default_item(self):
-        return {"pattern": "", "command": "", "priority": 5, "enabled": True}
+        return {"pattern": "", "command": "", "priority": 5, "enabled": True, "gui_target": ""}
 
     def tintin_commands(self, items):
         cmds = []
         # Clear all existing actions first so removals take effect
         cmds.append("#action {}")
         for d in items:
-            pat = d.get("pattern", "").strip()
-            cmd = d.get("command", "").strip()
-            pri = d.get("priority", 5)
+            pat    = d.get("pattern", "").strip()
+            cmd    = d.get("command", "").strip()
+            pri    = d.get("priority", 5)
+            target = d.get("gui_target", "").strip()
             if pat and d.get("enabled", True):
-                cmds.append(f"#action {{{pat}}} {{{cmd}}} {{{pri}}}")
+                if target:
+                    # Wrap command in ##GUI## showme so the GUI intercepts it
+                    body = f"#showme {{##GUI##{target}##%0}}"
+                    if cmd:
+                        # Also run the original command (semicolon-separated)
+                        body = f"{cmd};{body}"
+                    cmds.append(f"#action {{{pat}}} {{{body}}} {{{pri}}}")
+                else:
+                    cmds.append(f"#action {{{pat}}} {{{cmd}}} {{{pri}}}")
         return cmds
 
 
@@ -837,13 +876,16 @@ class ConfigDialog(QDialog):
 
     saved = pyqtSignal(dict)   # full config dict
 
-    def __init__(self, config: dict, parent=None):
+    def __init__(self, config: dict, parent=None, gui_targets: list = None):
         super().__init__(parent)
         self.setWindowTitle("Configuration")
         self.setMinimumSize(780, 520)
         self.setStyleSheet(_STYLE)
         # Non-modal so the user can still play while editing
         self.setWindowModality(Qt.WindowModality.NonModal)
+
+        # Keep gui_targets so we can pass them when rebuilding after tt++ reload
+        self._gui_targets: list = gui_targets or []
 
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 0, 0, 0)
@@ -855,10 +897,9 @@ class ConfigDialog(QDialog):
 
         self._buttons_tab    = _ButtonsTab(config.get("buttons",    []))
         self._aliases_tab    = _AliasesTab(config.get("aliases",    []))
-        self._actions_tab    = _ActionsTab(config.get("actions",    []))
+        self._actions_tab    = _ActionsTab(config.get("actions",    []), gui_targets=self._gui_targets)
         self._timers_tab     = _TimersTab(config.get("timers",      []))
         self._highlights_tab = _HighlightsTab(config.get("highlights", []))
-        self._variables_tab  = _VariablesTab(config.get("variables",  []))
         self._variables_tab  = _VariablesTab(config.get("variables",  []))
 
         self._tabs.addTab(self._actions_tab,    "Actions")
@@ -906,6 +947,13 @@ class ConfigDialog(QDialog):
         # Loader is set by MainWindow after construction
         self._loader_factory: object = None   # callable() → TinTinConfigLoader
 
+        # Single-shot timer used to clear the status label — stored as a member
+        # so it is automatically cancelled when the dialog is destroyed,
+        # preventing a segfault if the app closes while the timer is pending.
+        self._status_timer = QTimer(self)
+        self._status_timer.setSingleShot(True)
+        self._status_timer.timeout.connect(lambda: self._set_status(""))
+
     # ── Load from tt++ ───────────────────────────────────────────────
 
     def set_loader_factory(self, factory):
@@ -933,45 +981,46 @@ class ConfigDialog(QDialog):
         loader.load()
 
     def _on_tt_loaded(self, config: dict):
-        """Populate alias/action/timer/highlight tabs from live tt++ data."""
+        """Populate alias/action/timer/highlight/variable tabs from live tt++ data."""
         self._reload_btn.setEnabled(True)
 
-        # Preserve buttons — they are GUI-only and not in tt++ state
-        buttons = self._buttons_tab.get_items()
-
         self._aliases_tab    = _AliasesTab(config.get("aliases",    []))
-        self._actions_tab    = _ActionsTab(config.get("actions",    []))
+        self._actions_tab    = _ActionsTab(config.get("actions",    []), gui_targets=self._gui_targets)
         self._timers_tab     = _TimersTab(config.get("timers",      []))
         self._highlights_tab = _HighlightsTab(config.get("highlights", []))
         self._variables_tab  = _VariablesTab(config.get("variables",  []))
 
-        # Replace tabs 1-4 (leave Buttons at index 0 untouched)
+        # Rebuild the tab bar in-place, preserving the Buttons tab.
+        # Remove all tabs (widgets are NOT deleted — Python still owns them),
+        # then re-add in the correct order with the Buttons tab unchanged.
         current = self._tabs.currentIndex()
-        for idx, (tab, title) in enumerate([
-            (self._actions_tab,    "Actions"),
-            (self._aliases_tab,    "Aliases"),
-            (self._variables_tab,  "Variables"),
-            (self._timers_tab,     "Timers"),
-            (self._highlights_tab, "Highlights"),
-            (self._buttons_tab,    "Buttons"),
-        ], start=1):
-            self._tabs.removeTab(idx)
-            self._tabs.insertTab(idx, tab, title)
+        while self._tabs.count():
+            self._tabs.removeTab(0)
 
-        self._tabs.setCurrentIndex(current)
-        counts = (
+        self._tabs.addTab(self._actions_tab,    "Actions")
+        self._tabs.addTab(self._aliases_tab,    "Aliases")
+        self._tabs.addTab(self._variables_tab,  "Variables")
+        self._tabs.addTab(self._timers_tab,     "Timers")
+        self._tabs.addTab(self._highlights_tab, "Highlights")
+        self._tabs.addTab(self._buttons_tab,    "Buttons")   # unchanged
+
+        self._tabs.setCurrentIndex(
+            max(0, min(current, self._tabs.count() - 1))
+        )
+        n = (
             f"{len(config.get('aliases',    []))} aliases, "
             f"{len(config.get('actions',    []))} actions, "
             f"{len(config.get('timers',     []))} timers, "
-            f"{len(config.get('highlights', []))} highlights",
+            f"{len(config.get('highlights', []))} highlights, "
             f"{len(config.get('variables',  []))} variables"
         )
-        self._set_status(f"Loaded from TinTin++ — {counts}")
-        QTimer.singleShot(5000, lambda: self._set_status(""))
+        self._set_status(f"Loaded from TinTin++ — {n}")
+        self._status_timer.start(5000)
 
     def _on_tt_load_error(self, msg: str):
         self._reload_btn.setEnabled(True)
         self._set_status(f"Error: {msg}")
+        self._status_timer.start(5000)
 
     def _on_raw_dump(self, text: str):
         """Stash raw tt++ #write output for debugging; also print to stderr."""
@@ -994,7 +1043,7 @@ class ConfigDialog(QDialog):
         config = self.get_config()
         self.saved.emit(config)
         self._set_status("Saved.")
-        QTimer.singleShot(3000, lambda: self._set_status(""))
+        self._status_timer.start(3000)
 
     def get_config(self) -> dict:
         """Return the full config dict from all tabs."""
